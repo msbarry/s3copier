@@ -17,15 +17,17 @@ import (
 	"path"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-var baseDir = flag.String("baseDir", "", "Directory to copy s3 contents to. (required)")
-var bucket = flag.String("bucket", "", "S3 Bucket to copy contents from. (required)")
-var concurrency = flag.Int("concurrency", 10, "Number of concurrent connections to use.")
-var queueSize = flag.Int("queueSize", 100, "Size of the queue")
+var baseDir = flag.String("dest", "", "Directory to copy s3 contents to. (required)")
+var prefix = flag.String("prefix", "skadi", "Prefix")
+var bucket = flag.String("bucket", "elevation-tiles-prod", "S3 Bucket to copy contents from.")
+var concurrency = flag.Int("concurrency", 20, "Number of concurrent connections to use.")
+var queueSize = flag.Int("queueSize", 200, "Size of the queue")
 
 func main() {
 	flag.Parse()
@@ -34,7 +36,9 @@ func main() {
 		os.Exit(-1)
 	}
 
-	sess, err := session.NewSession()
+	sess, err := session.NewSession(&aws.Config{
+	  Credentials: credentials.AnonymousCredentials,
+	})
 	if err != nil {
 		log.Fatalf("Failed to create a new session. %v", err)
 	}
@@ -55,7 +59,7 @@ func DownloadBucket(client *s3.S3, bucket, baseDir string, concurrency, queueSiz
 			},
 		}}
 	wg := new(sync.WaitGroup)
-	statsTracker := NewStatsTracker(1 * time.Second)
+	statsTracker := NewStatsTracker(10 * time.Second)
 	defer statsTracker.Stop()
 
 	for i := 0; i < concurrency; i++ {
@@ -73,13 +77,13 @@ func DownloadBucket(client *s3.S3, bucket, baseDir string, concurrency, queueSiz
 	}
 
 	dc := &DirectoryCreator{baseDir: baseDir, dirsSeen: make(map[string]bool), newDirPermission: 0755}
-	req := &s3.ListObjectsV2Input{Bucket: aws.String(bucket)}
+	if err := dc.MkDirIfNeeded("/"); err != nil {
+		log.Fatalf("Failed to create directory due to %v", err)
+	}
+	req := &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: prefix}
 	err := client.ListObjectsV2Pages(req, func(resp *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, content := range resp.Contents {
 			key := *content.Key
-			if err := dc.MkDirIfNeeded(key); err != nil {
-				log.Fatalf("Failed to create directory for key %v due to %v", key, err)
-			}
 			keysChan <- key
 		}
 		return true
@@ -126,8 +130,9 @@ func (c *Copier) Copy(key string) (int64, error) {
 		return 0, err
 	}
 	defer op.Body.Close()
-
-	f, err := os.Create(path.Join(c.baseDir, key))
+	ss := strings.Split(key, "/")
+	s := ss[len(ss)-1]
+	f, err := os.Create(path.Join(c.baseDir, s))
 	if err != nil {
 		io.Copy(ioutil.Discard, op.Body)
 		return 0, err
